@@ -24,34 +24,69 @@ def order_points(pts):
     rect[3] = pts[np.argmax(diff)]  # BL
     return rect
 
-def find_board_corners(frame_bgr):
+def find_board_corners(frame_bgr, debug=False):
     """
-    Detect outer border (largest 4-corner contour) and return the corner points.
-    Returns: (corners, contour) or (None, None) if not found
+    Detect outer border using GREEN tape detection (HSV color space).
+    Returns: (corners, contour, debug_image) or (None, None, debug_image) if not found
     """
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    # Convert to HSV for better color detection
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     
-    # Edge detection
-    edges = cv2.Canny(blur, 50, 150)
-    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=2)
+    # Green color range in HSV (adjust if needed)
+    # Hue: 35-85 covers most greens
+    # Saturation: 40-255 (not too pale)
+    # Value: 40-255 (not too dark)
+    lower_green = np.array([35, 40, 40])
+    upper_green = np.array([85, 255, 255])
     
-    # Find contours
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Create mask for green color
+    green_mask = cv2.inRange(hsv, lower_green, upper_green)
+    
+    # Clean up the mask
+    kernel = np.ones((5, 5), np.uint8)
+    green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    green_mask = cv2.dilate(green_mask, kernel, iterations=2)
+    
+    # Create debug image showing the green mask
+    debug_img = cv2.cvtColor(green_mask, cv2.COLOR_GRAY2BGR)
+    
+    # Find contours in the green mask
+    contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours = sorted(contours, key=cv2.contourArea, reverse=True)
     
     frame_area = frame_bgr.shape[0] * frame_bgr.shape[1]
     
+    # Draw all contours on debug image
+    for i, c in enumerate(contours[:10]):
+        color = (0, 255, 0) if i == 0 else (0, 165, 255)
+        cv2.drawContours(debug_img, [c], -1, color, 2)
+    
+    # Try to find a 4-corner contour (the green tape border)
     for c in contours[:20]:
         peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) == 4:
-            area = cv2.contourArea(approx)
-            if area > 0.15 * frame_area:
-                corners = approx.reshape(4, 2)
-                return corners, c
+        # Try different approximation tolerances
+        for tolerance in [0.02, 0.03, 0.04, 0.05, 0.06]:
+            approx = cv2.approxPolyDP(c, tolerance * peri, True)
+            if len(approx) == 4:
+                area = cv2.contourArea(approx)
+                # Check if it's a significant portion of the frame
+                if area > 0.08 * frame_area:
+                    corners = approx.reshape(4, 2)
+                    # Draw found corners on debug
+                    for pt in corners:
+                        cv2.circle(debug_img, (int(pt[0]), int(pt[1])), 10, (255, 0, 255), -1)
+                    return corners, c, debug_img
     
-    return None, None
+    # Fallback: If no 4-corner found, use minimum bounding rectangle of largest contour
+    if contours and cv2.contourArea(contours[0]) > 0.08 * frame_area:
+        rect = cv2.minAreaRect(contours[0])
+        box = cv2.boxPoints(rect)
+        corners = np.int32(box)
+        cv2.drawContours(debug_img, [corners], -1, (255, 0, 0), 3)
+        return corners, contours[0], debug_img
+    
+    return None, None, debug_img
 
 def draw_corners_and_grid(frame_bgr, corners):
     """
@@ -201,55 +236,100 @@ def main():
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"Camera resolution: {frame_width}x{frame_height}")
+    print("\nLive corner detection mode")
+    print("Controls:")
+    print("  q - Quit")
+    print("  s - Save snapshot")
+    print("  w - Toggle warped view")
+    print("  d - Toggle debug view (shows edge detection)")
     
-    # Warm up camera
-    print("Warming up camera...")
-    for _ in range(10):
-        cap.read()
+    show_warped = False
+    show_debug = True  # Start with debug on to see what's happening
     
-    # Capture a single frame
-    print("Capturing image...")
-    ret, frame = cap.read()
+    while True:
+        ret, frame = cap.read()
+        
+        if not ret:
+            print("Error: Could not read frame")
+            break
+        
+        # Rotate 180 degrees (matching your camera setup)
+        frame = cv2.rotate(frame, cv2.ROTATE_180)
+        
+        # Find corners (with debug image)
+        corners, contour, debug_img = find_board_corners(frame, debug=True)
+        
+        # Draw overlay on original frame
+        overlay_frame, ordered_corners = draw_corners_and_grid(frame, corners)
+        
+        # Add status text
+        if corners is not None:
+            status = "Board DETECTED - Corners marked"
+            color = (0, 255, 0)
+        else:
+            status = "Searching for board corners..."
+            color = (0, 0, 255)
+        
+        cv2.putText(overlay_frame, status, (10, frame_height - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+        cv2.putText(overlay_frame, "q=quit, s=save, w=warped, d=debug",
+                    (10, frame_height - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        
+        # Show main view
+        cv2.imshow('Corner Detection - Press Q to quit', overlay_frame)
+        
+        # Show debug view (edge detection) if enabled
+        if show_debug:
+            debug_resized = cv2.resize(debug_img, (frame_width, frame_height))
+            cv2.putText(debug_resized, "DEBUG: Edge Detection + Contours", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            cv2.putText(debug_resized, "Green=largest contour, Orange=other contours, Pink=corners", (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.imshow('Debug: Edge Detection', debug_resized)
+        
+        # Show warped view if enabled and corners detected
+        if show_warped and corners is not None:
+            warped = warp_board(frame, corners)
+            warped_with_grid = draw_grid_on_warped(warped)
+            display_warped = cv2.resize(warped_with_grid, (800, 500))
+            cv2.imshow('Warped Board View', display_warped)
+        
+        key = cv2.waitKey(1) & 0xFF
+        
+        if key == ord('q'):
+            print("Closing...")
+            break
+        elif key == ord('s'):
+            # Save snapshot
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            overlay_filename = f"corner_overlay_{timestamp}.jpg"
+            cv2.imwrite(overlay_filename, overlay_frame)
+            print(f"Saved: {overlay_filename}")
+            
+            # Save debug image
+            debug_filename = f"corner_debug_{timestamp}.jpg"
+            cv2.imwrite(debug_filename, debug_img)
+            print(f"Saved: {debug_filename}")
+            
+            if corners is not None:
+                warped = warp_board(frame, corners)
+                warped_with_grid = draw_grid_on_warped(warped)
+                warped_filename = f"corner_warped_{timestamp}.jpg"
+                cv2.imwrite(warped_filename, warped_with_grid)
+                print(f"Saved: {warped_filename}")
+        elif key == ord('w'):
+            show_warped = not show_warped
+            if not show_warped:
+                cv2.destroyWindow('Warped Board View')
+            print(f"Warped view: {'ON' if show_warped else 'OFF'}")
+        elif key == ord('d'):
+            show_debug = not show_debug
+            if not show_debug:
+                cv2.destroyWindow('Debug: Edge Detection')
+            print(f"Debug view: {'ON' if show_debug else 'OFF'}")
+    
     cap.release()
-    
-    if not ret:
-        print("Error: Could not capture frame")
-        return
-    
-    # Rotate 180 degrees (matching your camera setup)
-    frame = cv2.rotate(frame, cv2.ROTATE_180)
-    
-    # Find corners
-    corners, contour = find_board_corners(frame)
-    
-    # Draw overlay on original frame
-    overlay_frame, ordered_corners = draw_corners_and_grid(frame, corners)
-    
-    # Add status text
-    if corners is not None:
-        status = "Board DETECTED - Corners marked"
-        print(status)
-    else:
-        status = "Board NOT detected"
-        print(status)
-    
-    cv2.putText(overlay_frame, status, (10, frame_height - 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0) if corners is not None else (0, 0, 255), 2)
-    
-    # Save the overlay image
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    overlay_filename = f"corner_overlay_{timestamp}.jpg"
-    cv2.imwrite(overlay_filename, overlay_frame)
-    print(f"Saved: {overlay_filename}")
-    
-    # Save warped view if corners detected
-    if corners is not None:
-        warped = warp_board(frame, corners)
-        warped_with_grid = draw_grid_on_warped(warped)
-        warped_filename = f"corner_warped_{timestamp}.jpg"
-        cv2.imwrite(warped_filename, warped_with_grid)
-        print(f"Saved: {warped_filename}")
-    
+    cv2.destroyAllWindows()
     print("Done!")
 
 if __name__ == "__main__":

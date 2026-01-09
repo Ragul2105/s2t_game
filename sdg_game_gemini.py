@@ -10,6 +10,8 @@ import base64
 import re
 from datetime import datetime
 import requests
+from PIL import Image, ImageTk
+import fitz  # PyMuPDF for PDF to image conversion
 
 # ----------------------------
 # GAME CONFIG
@@ -26,6 +28,9 @@ CAM_INDEX_DEFAULT = 0
 # Training data folder
 TRAINING_DATA_DIR = "training_data_gemini"
 
+# Leaderboard file
+LEADERBOARD_FILE = "leaderboard.json"
+
 # Google Cloud Vision API Key - Set via environment variable or directly here
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 
@@ -37,6 +42,102 @@ SDG_COLORS = {
     13: "#3F7E44", 14: "#0A97D9", 15: "#56C02B", 16: "#00689D",
     17: "#19486A"
 }
+
+# SDG Images folder
+IMAGES_FOLDER = "images"
+
+# SDG PDF filenames mapping (number to filename)
+SDG_PDF_FILES = {
+    1: "1.pdf",
+    2: "2.pdf",
+    3: "3.pdf",
+    4: "4.pdf",
+    5: "5.pdf",
+    6: "6.pdf",
+    7: "7.pdf",
+    8: "8.pdf",
+    9: "9.pdf",
+    10: "10.pdf",
+    11: "11.pdf",
+    12: "12.pdf",
+    13: "13.pdf",
+    14: "14.pdf",
+    15: "15.pdf",
+    16: "16.pdf",
+    17: "17.pdf"
+}
+
+def load_sdg_images_from_pdfs():
+    """
+    Load all SDG PDF files and convert them to PIL images.
+    Returns a dictionary mapping SDG number (1-17) to PIL Image.
+    """
+    sdg_images = {}
+    
+    for num, filename in SDG_PDF_FILES.items():
+        pdf_path = os.path.join(IMAGES_FOLDER, filename)
+        if os.path.exists(pdf_path):
+            try:
+                # Open PDF with PyMuPDF
+                doc = fitz.open(pdf_path)
+                if len(doc) > 0:
+                    page = doc[0]  # Get first page
+                    # Render at higher resolution for better quality
+                    mat = fitz.Matrix(3, 3)  # 3x zoom for better quality
+                    pix = page.get_pixmap(matrix=mat)
+                    # Convert to PIL Image
+                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    sdg_images[num] = img
+                doc.close()
+            except Exception as e:
+                print(f"Error loading PDF {filename}: {e}")
+        else:
+            print(f"Warning: PDF not found: {pdf_path}")
+    
+    return sdg_images
+
+# ----------------------------
+# LEADERBOARD HELPERS
+# ----------------------------
+def load_leaderboard():
+    """Load leaderboard from JSON file. Returns list of score entries."""
+    if os.path.exists(LEADERBOARD_FILE):
+        try:
+            with open(LEADERBOARD_FILE, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Error loading leaderboard: {e}")
+    return []
+
+def save_leaderboard(leaderboard):
+    """Save leaderboard to JSON file."""
+    try:
+        with open(LEADERBOARD_FILE, "w") as f:
+            json.dump(leaderboard, f, indent=2)
+    except Exception as e:
+        print(f"Error saving leaderboard: {e}")
+
+def add_score_to_leaderboard(player_name, correct, total):
+    """Add a new score to leaderboard and keep top 10."""
+    leaderboard = load_leaderboard()
+    percentage = round(correct / total * 100, 2)
+    
+    entry = {
+        "name": player_name,
+        "correct": correct,
+        "total": total,
+        "percentage": percentage,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    
+    leaderboard.append(entry)
+    # Sort by percentage (descending), then by correct count (descending)
+    leaderboard.sort(key=lambda x: (x["percentage"], x["correct"]), reverse=True)
+    # Keep only top 10
+    leaderboard = leaderboard[:10]
+    
+    save_leaderboard(leaderboard)
+    return leaderboard
 
 # ----------------------------
 # GEMINI VISION API HELPER
@@ -392,6 +493,15 @@ class SDGGameApp:
         self.canvas = tk.Canvas(root, bg="black", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
 
+        # Load SDG images from PDFs
+        print("Loading SDG images from PDFs...")
+        self.sdg_pil_images = load_sdg_images_from_pdfs()
+        print(f"Loaded {len(self.sdg_pil_images)} SDG images")
+        
+        # Dictionary to store resized PhotoImage objects (will be populated on draw)
+        self.sdg_tk_images = {}
+        self.current_cell_size = (0, 0)  # Track current cell size for resizing
+
         self.info_text = self.canvas.create_text(
             20, 20, anchor="nw", fill="white",
             font=("Helvetica", 26, "bold"),
@@ -418,21 +528,26 @@ class SDGGameApp:
         self.show_results = False  # toggle between expected and results view
         self.round_running = False
         self.end_time = None
+        
+        # Player info
+        self.player_name = None
+        self.show_leaderboard = True  # Start with leaderboard view
 
         # Create training data directory
         os.makedirs(TRAINING_DATA_DIR, exist_ok=True)
 
         self.root.bind("<Escape>", lambda e: self.quit())
-        self.root.bind("n", lambda e: self.start_new_round())
-        self.root.bind("N", lambda e: self.start_new_round())
-        self.root.bind("r", lambda e: self.start_new_round())
-        self.root.bind("R", lambda e: self.start_new_round())
-        self.root.bind("t", lambda e: self.toggle_results_view())
-        self.root.bind("T", lambda e: self.toggle_results_view())
+        self.root.bind("n", lambda e: self.prompt_player_name())
+        self.root.bind("N", lambda e: self.prompt_player_name())
+        self.root.bind("r", lambda e: self.prompt_player_name())
+        self.root.bind("R", lambda e: self.prompt_player_name())
+        self.root.bind("h", lambda e: self.show_home_screen())
+        self.root.bind("H", lambda e: self.show_home_screen())
 
         self.root.bind("<Configure>", lambda e: self.redraw())
 
-        self.redraw()
+        # Show leaderboard on startup
+        self.show_home_screen()
 
     def quit(self):
         try:
@@ -441,19 +556,197 @@ class SDGGameApp:
             pass
         self.root.destroy()
 
+    def show_home_screen(self):
+        """Show the leaderboard/home screen."""
+        if self.round_running:
+            return
+        self.show_leaderboard = True
+        self.show_results = False
+        self.expected = None
+        self.player_name = None
+        self.draw_leaderboard()
+
+    def draw_leaderboard(self):
+        """Draw the leaderboard screen."""
+        self.clear_grid()
+        
+        w = self.canvas.winfo_width()
+        h = self.canvas.winfo_height()
+        
+        # Title
+        title = self.canvas.create_text(
+            w / 2, 100,
+            text="🏆 SDG TILE GAME - LEADERBOARD 🏆",
+            fill="#FFD700",
+            font=("Helvetica", 64, "bold"),
+            anchor="center"
+        )
+        self.grid_items.append(title)
+        
+        # Load leaderboard data
+        leaderboard = load_leaderboard()
+        
+        # Leaderboard table header
+        header_y = 220
+        headers = ["RANK", "PLAYER", "SCORE", "PERCENTAGE", "DATE"]
+        header_x_positions = [w * 0.1, w * 0.3, w * 0.5, w * 0.65, w * 0.85]
+        
+        for i, header in enumerate(headers):
+            header_txt = self.canvas.create_text(
+                header_x_positions[i], header_y,
+                text=header,
+                fill="#00BFFF",
+                font=("Helvetica", 32, "bold"),
+                anchor="center"
+            )
+            self.grid_items.append(header_txt)
+        
+        # Separator line
+        line = self.canvas.create_line(
+            w * 0.05, header_y + 40, w * 0.95, header_y + 40,
+            fill="#00BFFF", width=3
+        )
+        self.grid_items.append(line)
+        
+        # Leaderboard entries
+        if leaderboard:
+            for i, entry in enumerate(leaderboard[:10]):
+                row_y = header_y + 90 + i * 70
+                
+                # Rank with medal for top 3
+                rank_text = f"{i + 1}"
+                if i == 0:
+                    rank_text = "🥇 1"
+                    rank_color = "#FFD700"
+                elif i == 1:
+                    rank_text = "🥈 2"
+                    rank_color = "#C0C0C0"
+                elif i == 2:
+                    rank_text = "🥉 3"
+                    rank_color = "#CD7F32"
+                else:
+                    rank_color = "white"
+                
+                rank_txt = self.canvas.create_text(
+                    header_x_positions[0], row_y,
+                    text=rank_text,
+                    fill=rank_color,
+                    font=("Helvetica", 30, "bold"),
+                    anchor="center"
+                )
+                self.grid_items.append(rank_txt)
+                
+                # Player name
+                name_txt = self.canvas.create_text(
+                    header_x_positions[1], row_y,
+                    text=entry.get("name", "Unknown")[:15],
+                    fill="white",
+                    font=("Helvetica", 30),
+                    anchor="center"
+                )
+                self.grid_items.append(name_txt)
+                
+                # Score
+                score_txt = self.canvas.create_text(
+                    header_x_positions[2], row_y,
+                    text=f"{entry.get('correct', 0)}/{entry.get('total', 40)}",
+                    fill="white",
+                    font=("Helvetica", 30),
+                    anchor="center"
+                )
+                self.grid_items.append(score_txt)
+                
+                # Percentage
+                pct_txt = self.canvas.create_text(
+                    header_x_positions[3], row_y,
+                    text=f"{entry.get('percentage', 0)}%",
+                    fill="#00FF00" if entry.get('percentage', 0) >= 80 else "#FFFF00" if entry.get('percentage', 0) >= 50 else "#FF6347",
+                    font=("Helvetica", 30, "bold"),
+                    anchor="center"
+                )
+                self.grid_items.append(pct_txt)
+                
+                # Date
+                date_txt = self.canvas.create_text(
+                    header_x_positions[4], row_y,
+                    text=entry.get("timestamp", "")[:10],
+                    fill="#AAAAAA",
+                    font=("Helvetica", 26),
+                    anchor="center"
+                )
+                self.grid_items.append(date_txt)
+        else:
+            # No entries message
+            no_entries = self.canvas.create_text(
+                w / 2, h / 2,
+                text="No scores yet! Be the first to play!",
+                fill="#888888",
+                font=("Helvetica", 40),
+                anchor="center"
+            )
+            self.grid_items.append(no_entries)
+        
+        # Update status text
+        self.canvas.itemconfig(self.info_text, text="")
+        self.canvas.itemconfig(self.timer_text, text="")
+        self.canvas.itemconfig(
+            self.status_text,
+            text="Press N to start a new game  |  ESC to quit"
+        )
+
+    def prompt_player_name(self):
+        """Prompt for player name before starting the game."""
+        if self.round_running:
+            return
+        
+        # Create a simple dialog to get player name
+        from tkinter import simpledialog
+        
+        name = simpledialog.askstring(
+            "Player Name",
+            "Enter your name:",
+            parent=self.root
+        )
+        
+        if name and name.strip():
+            self.player_name = name.strip()
+            self.show_leaderboard = False
+            self.start_new_round()
+        else:
+            # User cancelled or entered empty name
+            pass
+
     def start_new_round(self):
         if self.round_running:
             return
 
         # Reset results view
         self.show_results = False
+        self.show_leaderboard = False
         self.predictions = None
         self.last_score = None
         self.gemini_raw_response = None
 
-        # Generate random expected layout (numbers 1..17 with repetition)
-        nums = [random.randint(1, 17) for _ in range(ROWS * COLS)]
+        # Generate random expected layout (numbers 1..17, each number max 3 times)
+        # With 40 cells and 17 numbers, we need at least 40/3 ≈ 14 different numbers
+        # Each number can appear 1-3 times, total must equal 40
+        available = []
+        for num in range(1, 18):
+            available.extend([num] * 3)  # Each number available up to 3 times
+        
+        random.shuffle(available)
+        nums = available[:ROWS * COLS]  # Take exactly 40 numbers
+        random.shuffle(nums)  # Shuffle again for good distribution
+        
         self.expected = [nums[r*COLS:(r+1)*COLS] for r in range(ROWS)]
+
+        # Print the generated matrix to console
+        print("\n" + "="*50)
+        print("GENERATED 5x8 MATRIX (Expected Pattern):")
+        print("="*50)
+        for r, row in enumerate(self.expected):
+            print(f"Row {r}: {row}")
+        print("="*50 + "\n")
 
         self.round_running = True
         self.end_time = time.time() + ROUND_SECONDS
@@ -464,17 +757,14 @@ class SDGGameApp:
 
     def redraw(self):
         # Refresh UI layout when window size changes
-        if self.show_results and self.predictions is not None:
-            self.draw_results_grid()
+        if self.show_leaderboard:
+            self.draw_leaderboard()
+        elif self.show_results and self.predictions is not None and self.last_score is not None:
+            correct, total = self.last_score
+            percentage = round(correct / total * 100, 1)
+            self.draw_score_screen(correct, total, percentage)
         elif self.expected is not None:
             self.draw_grid(self.expected)
-
-    def toggle_results_view(self):
-        """Toggle between expected pattern and results comparison view."""
-        if self.predictions is None:
-            return
-        self.show_results = not self.show_results
-        self.redraw()
 
     def update_timer_loop(self):
         if not self.round_running:
@@ -502,6 +792,33 @@ class SDGGameApp:
             self.canvas.delete(item)
         self.grid_items = []
 
+    def resize_sdg_images(self, cell_w, cell_h):
+        """
+        Resize all SDG images to fit the cell size.
+        Caches resized images to avoid repeated resizing.
+        """
+        new_size = (int(cell_w), int(cell_h))
+        
+        # Only resize if cell size changed
+        if new_size == self.current_cell_size and self.sdg_tk_images:
+            return
+        
+        self.current_cell_size = new_size
+        self.sdg_tk_images = {}
+        
+        padding = 4  # Small padding inside cell
+        img_w = max(1, int(cell_w - padding * 2))
+        img_h = max(1, int(cell_h - padding * 2))
+        
+        for num, pil_img in self.sdg_pil_images.items():
+            try:
+                # Resize maintaining aspect ratio
+                resized = pil_img.copy()
+                resized.thumbnail((img_w, img_h), Image.Resampling.LANCZOS)
+                self.sdg_tk_images[num] = ImageTk.PhotoImage(resized)
+            except Exception as e:
+                print(f"Error resizing SDG {num} image: {e}")
+
     def draw_grid(self, grid):
         self.clear_grid()
 
@@ -519,6 +836,9 @@ class SDGGameApp:
         cell_w = grid_w / COLS
         cell_h = grid_h / ROWS
 
+        # Resize SDG images if needed
+        self.resize_sdg_images(cell_w, cell_h)
+
         # Draw
         for r in range(ROWS):
             for c in range(COLS):
@@ -530,29 +850,41 @@ class SDGGameApp:
                 val = grid[r][c]
                 color = SDG_COLORS.get(val, "#444444")
 
+                # Draw cell background
                 rect = self.canvas.create_rectangle(
                     x1, y1, x2, y2,
                     fill=color, outline="white", width=2
                 )
                 self.grid_items.append(rect)
 
-                # Big number
-                num_txt = self.canvas.create_text(
-                    (x1 + x2) / 2, (y1 + y2) / 2 - 10,
-                    text=str(val),
-                    fill="white",
-                    font=("Helvetica", int(min(cell_w, cell_h) * 0.35), "bold")
-                )
-                self.grid_items.append(num_txt)
+                # Draw SDG image if available
+                if val in self.sdg_tk_images:
+                    center_x = (x1 + x2) / 2
+                    center_y = (y1 + y2) / 2
+                    img_item = self.canvas.create_image(
+                        center_x, center_y,
+                        image=self.sdg_tk_images[val],
+                        anchor="center"
+                    )
+                    self.grid_items.append(img_item)
+                else:
+                    # Fallback: show number if image not available
+                    num_txt = self.canvas.create_text(
+                        (x1 + x2) / 2, (y1 + y2) / 2 - 10,
+                        text=str(val),
+                        fill="white",
+                        font=("Helvetica", int(min(cell_w, cell_h) * 0.35), "bold")
+                    )
+                    self.grid_items.append(num_txt)
 
-                # Small hint
-                hint_txt = self.canvas.create_text(
-                    (x1 + x2) / 2, y2 - 18,
-                    text="SDG",
-                    fill="white",
-                    font=("Helvetica", 14, "bold")
-                )
-                self.grid_items.append(hint_txt)
+                    # Small hint
+                    hint_txt = self.canvas.create_text(
+                        (x1 + x2) / 2, y2 - 18,
+                        text="SDG",
+                        fill="white",
+                        font=("Helvetica", 14, "bold")
+                    )
+                    self.grid_items.append(hint_txt)
 
     def draw_results_grid(self):
         """Draw a comparison grid showing expected vs found values."""
@@ -640,7 +972,7 @@ class SDGGameApp:
     def process_scoring(self):
         """
         What happens at time end:
-        1) wait 2 seconds for user to move away from the board
+        1) show 5 second countdown for user to move away from the board
         2) capture best frame from camera
         3) detect board border + warp to top-down (or use full frame if no border)
         4) send warped image to Gemini API
@@ -649,9 +981,20 @@ class SDGGameApp:
         7) display results in Tkinter UI
         8) save images and Gemini response for training
         """
-        # Wait 2 seconds for user to move away from the board
-        self.root.after(0, lambda: self.canvas.itemconfig(self.status_text, text="Step away from the board... capturing in 2 seconds"))
-        time.sleep(2)
+        # Show 5 second countdown for user to move away from the board
+        for countdown in range(5, 0, -1):
+            self.root.after(0, lambda c=countdown: self.canvas.itemconfig(
+                self.status_text, 
+                text=f"Step away from the board... capturing in {c} seconds"
+            ))
+            self.root.after(0, lambda c=countdown: self.canvas.itemconfig(
+                self.timer_text,
+                text=f"📸 {c}"
+            ))
+            time.sleep(1)
+        
+        self.root.after(0, lambda: self.canvas.itemconfig(self.status_text, text="Capturing image..."))
+        self.root.after(0, lambda: self.canvas.itemconfig(self.timer_text, text="📸"))
         
         try:
             frame = capture_best_frame(self.cam_index, burst=8)
@@ -765,13 +1108,98 @@ class SDGGameApp:
     def _update_ui_after_scoring(self, correct, total):
         """Update the UI after scoring is complete (called from main thread)."""
         percentage = round(correct / total * 100, 1)
-        self.canvas.itemconfig(self.info_text, text=f"RESULTS: {correct}/{total} ({percentage}%) correct")
+        
+        # Save score to leaderboard
+        if self.player_name:
+            add_score_to_leaderboard(self.player_name, correct, total)
+            print(f"Score saved for {self.player_name}: {correct}/{total} ({percentage}%)")
+        
+        # Print detailed results to console
+        print("\n" + "="*60)
+        print(f"RESULTS FOR: {self.player_name}")
+        print("="*60)
+        print(f"SCORE: {correct}/{total} ({percentage}%)")
+        print("\nEXPECTED vs PREDICTED COMPARISON:")
+        print("-"*60)
+        for r in range(ROWS):
+            exp_row = self.expected[r]
+            pred_row = self.predictions[r]
+            matches = ["✓" if exp_row[c] == pred_row[c] else "✗" for c in range(COLS)]
+            print(f"Row {r}: Exp {exp_row}")
+            print(f"        Got {pred_row}")
+            print(f"        {' '.join(f'{m:>2}' for m in matches)}")
+        print("="*60 + "\n")
+        
+        # Draw big score on screen
+        self.draw_score_screen(correct, total, percentage)
+        
+        # Return to home screen after 10 seconds
+        self.root.after(10000, self.show_home_screen)
+
+    def draw_score_screen(self, correct, total, percentage):
+        """Draw a big score display in the center of the screen."""
+        self.clear_grid()
+        
+        w = self.canvas.winfo_width()
+        h = self.canvas.winfo_height()
+        
+        # Hide default text items
+        self.canvas.itemconfig(self.info_text, text="")
         self.canvas.itemconfig(self.timer_text, text="")
-        self.canvas.itemconfig(
-            self.status_text,
-            text=f"Score: {correct}/{total}. Press T to toggle view. Press N for new round. Data saved to {TRAINING_DATA_DIR}/"
+        self.canvas.itemconfig(self.status_text, text="")
+        
+        # Player name
+        player_txt = self.canvas.create_text(
+            w / 2, h * 0.15,
+            text=f"🎮 {self.player_name} 🎮",
+            fill="#00BFFF",
+            font=("Helvetica", 56, "bold"),
+            anchor="center"
         )
-        self.draw_results_grid()
+        self.grid_items.append(player_txt)
+        
+        # Big score number
+        score_txt = self.canvas.create_text(
+            w / 2, h * 0.45,
+            text=f"{correct}/{total}",
+            fill="#FFFFFF",
+            font=("Helvetica", 180, "bold"),
+            anchor="center"
+        )
+        self.grid_items.append(score_txt)
+        
+        # Percentage with color based on performance
+        if percentage >= 80:
+            pct_color = "#00FF00"  # Green
+            emoji = "🏆"
+        elif percentage >= 60:
+            pct_color = "#FFFF00"  # Yellow
+            emoji = "👍"
+        elif percentage >= 40:
+            pct_color = "#FFA500"  # Orange
+            emoji = "💪"
+        else:
+            pct_color = "#FF6347"  # Red
+            emoji = "🎯"
+        
+        pct_txt = self.canvas.create_text(
+            w / 2, h * 0.68,
+            text=f"{emoji} {percentage}% {emoji}",
+            fill=pct_color,
+            font=("Helvetica", 90, "bold"),
+            anchor="center"
+        )
+        self.grid_items.append(pct_txt)
+        
+        # Status message
+        status_txt = self.canvas.create_text(
+            w / 2, h * 0.88,
+            text="Returning to leaderboard in 10 seconds...  |  Press H for home",
+            fill="#888888",
+            font=("Helvetica", 28),
+            anchor="center"
+        )
+        self.grid_items.append(status_txt)
 
 def main():
     global ROUND_SECONDS, GOOGLE_API_KEY
